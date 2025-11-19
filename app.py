@@ -69,16 +69,24 @@ def get_mountain_mask():
 # --- Coarse Map Preview (Instant, No Heavy Processing) ---
 def get_coarse_preview():
     try:
-        img = ee.Image("MODIS/061/MOD13A2") \
+        viirs = ee.ImageCollection("NOAA/VIIRS/001/VNP09GA") \
             .filterDate(start_date, end_date) \
-            .select("NDVI") \
-            .mean() \
-            .updateMask(SAUDI.geometry()) \
-            .resample("nearest") \
-            .reproject("EPSG:4326", None, 2000)  # Very coarse
+            .select(["I3","I2"]) \
+            .mean()
 
-        return img
-    except Exception:
+        # NDVI = (NIR - RED) / (NIR + RED)
+        ndvi = viirs.expression(
+            "(nir - red) / (nir + red)", {
+                "nir": viirs.select("I3"),
+                "red": viirs.select("I2")
+            }
+        ).updateMask(SAUDI.geometry()) \
+         .reproject("EPSG:4326", None, 4000)  # VERY FAST, COARSE
+
+        return ndvi
+
+    except Exception as e:
+        print("COARSE PREVIEW ERROR:", e)
         return None
 
 
