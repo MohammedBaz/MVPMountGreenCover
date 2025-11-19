@@ -1,24 +1,21 @@
-import json
 import streamlit as st
-import os 
-dictionary = {'type':st.secrets['type'],
-              'project_id':st.secrets['project_id'],
-              'private_key_id':st.secrets['private_key_id'],
-              'private_key':st.secrets['private_key'],
-              'client_email':st.secrets['client_email'],
-              'client_id':st.secrets['client_id'],
-              'auth_uri':st.secrets['auth_uri'],
-              'token_uri':st.secrets['token_uri'],
-              'auth_provider_x509_cert_url':st.secrets['auth_provider_x509_cert_url'],
-              'client_x509_cert_url':st.secrets['client_x509_cert_url']
-             }
-
-#https://signup.earthengine.google.com/#!/service_accounts
-PathtoKeyFile=os.path.join(os.getcwd(), "key.json")
-with open(os.path.join(os.getcwd(), "key.json"), 'w') as outfile:
-    json.dump(dictionary, outfile)
-
+from streamlit_folium import folium_static
+import folium
 import ee
-EE_CREDENTIALS = ee.ServiceAccountCredentials(st.secrets['client_email'], PathtoKeyFile)
-ee.Initialize(EE_CREDENTIALS)
-st.write("____________________________________ Initalised______________________________________________")
+
+st.set_page_config(page_title="Saudi MGCI 2025", layout="wide")
+st.title("🌿 Saudi Arabia Mountain Green Cover Index 2025")
+st.markdown("**Live Interactive Map • SDG 15.4.2 • Google Earth Engine + Deep Learning**")
+
+# ========= AUTHENTICATION (your service account) =========
+try:
+    ee.Initialize(
+        ee.ServiceAccountCredentials(
+            st.secrets["gcp_service_account"]["client_email"],
+            st.secrets["gcp_service_account"]["private_key"]
+        )
+    )
+    st.success("Earth Engine Successfully Initialized! 🚀")
+except Exception as e:
+    st.error("Authentication failed – check your secrets")
+    st.stop()
