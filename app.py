@@ -6,12 +6,18 @@ import numpy as np
 # --------------------------------------------------
 # 1. SAFE EE INITIALIZATION
 # --------------------------------------------------
-EE_OK = False
 try:
-    ee.Initialize()
-    EE_OK = True
+    credentials = ee.ServiceAccountCredentials(
+        st.secrets["gcp_service_account"]["client_email"],
+        key_data=st.secrets["gcp_service_account"]["private_key"]
+    )
+    
+    ee.Initialize(credentials)
+    st.success("✅ Earth Engine Successfully Initialized!")
+
 except Exception as e:
-    st.warning("⚠ Earth Engine is not initialized – using dummy preview mode.")
+    st.error(f"❌ Authentication failed: {e}")
+    st.stop()
 
 # --------------------------------------------------
 # 2. GLOBAL APP CONFIG
