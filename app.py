@@ -4,42 +4,46 @@ import pandas as pd
 import numpy as np
 
 # --------------------------------------------------
+# 0. APP CONFIG – must come first
+# --------------------------------------------------
+st.set_page_config(page_title="Mountain Green Cover MVP", layout="wide")
+st.title("🏔️ Mountain Green Cover – MVP Demo")
+
+# --------------------------------------------------
 # 1. SAFE EE INITIALIZATION
 # --------------------------------------------------
+EE_OK = False
 try:
     credentials = ee.ServiceAccountCredentials(
         st.secrets["gcp_service_account"]["client_email"],
         key_data=st.secrets["gcp_service_account"]["private_key"]
     )
-    
+
     ee.Initialize(credentials)
     st.success("✅ Earth Engine Successfully Initialized!")
+    EE_OK = True
 
 except Exception as e:
     st.error(f"❌ Authentication failed: {e}")
-    st.stop()
+    EE_OK = False
 
 # --------------------------------------------------
-# 2. GLOBAL APP CONFIG
+# 2. GLOBALS
 # --------------------------------------------------
-st.set_page_config(page_title="Mountain Green Cover MVP", layout="wide")
-st.title("🏔️ Mountain Green Cover – MVP Demo")
-
-# Default dates (avoid undefined variables)
 start_date = "2014-01-01"
 end_date = "2024-01-01"
 
-# Saudi bounding box
+# Create AOI only if EE works
 AOI = ee.Geometry.Rectangle([37.0, 16.0, 55.0, 33.0]) if EE_OK else None
 
 # --------------------------------------------------
-# 3. FAST COARSE PREVIEW (ALWAYS RETURNS INSTANT)
+# 3. FAST COARSE PREVIEW
 # --------------------------------------------------
 st.subheader("⚡ Fast Preview")
 
 try:
     if not EE_OK:
-        raise ValueError("EE unavailable")
+        raise ValueError("Earth Engine unavailable")
 
     coarse = (
         ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
@@ -49,33 +53,32 @@ try:
         .median()
     )
 
-    # SAFE map ID
-    coarse_map = ee.Image(coarse).getThumbURL({
-        "min": 0, "max": 1, 
+    img_url = coarse.getThumbURL({
+        "min": 0,
+        "max": 1,
         "region": AOI,
         "dimensions": 512
     })
 
-    st.image(coarse_map, caption="Coarse Preview", use_column_width=True)
+    st.image(img_url, caption="Coarse Preview", use_column_width=True)
 
 except Exception:
-    # 💨 ALWAYS RETURNS – ensures responsiveness
+    # Fallback preview so MVP is always responsive
     st.image(
         "https://picsum.photos/600/300",
         caption="Dummy Coarse Preview (fast fallback)",
         use_column_width=True
     )
 
-
 # --------------------------------------------------
-# 4. HIGH-RES COMPUTE (REAL EE PROCESSING)
+# 4. HIGH-RES MGCI
 # --------------------------------------------------
 st.subheader("🟢 Compute High-Res MGCI")
 
 if st.button("Compute High-Res"):
     try:
         if not EE_OK:
-            raise ValueError("EE unavailable")
+            raise ValueError("Earth Engine unavailable")
 
         mgci = (
             ee.ImageCollection("MODIS/061/MOD13Q1")
@@ -84,22 +87,22 @@ if st.button("Compute High-Res"):
             .mean()
         )
 
-        url = mgci.getThumbURL({
-            "min": 0, "max": 9000,
+        highres_url = mgci.getThumbURL({
+            "min": 0,
+            "max": 9000,
             "region": AOI,
             "dimensions": 2048,
             "palette": ["#f7fcf5", "#00441b"],
         })
 
-        st.image(url, caption="High-Resolution MGCI", use_column_width=True)
+        st.image(highres_url, caption="High-Resolution MGCI", use_column_width=True)
 
     except Exception as e:
         st.error("High-res computation failed.")
         st.exception(e)
 
-
 # --------------------------------------------------
-# 5. AI INSIGHTS (INSTANT + LIGHTWEIGHT)
+# 5. AI INSIGHTS
 # --------------------------------------------------
 st.subheader("🤖 AI Insights")
 
@@ -114,15 +117,13 @@ if st.button("Run AI Insight"):
 
     st.write("**Summary:** Southern provinces show higher green mountain fraction.")
 
-
 # --------------------------------------------------
-# 6. MULTI-VISUALIZATION (PLOTS ONLY – NO EE)
+# 6. MULTI-VISUALIZATION
 # --------------------------------------------------
 st.subheader("📈 Multi-Visualization")
 
 years = np.arange(2014, 2025)
-series = np.random.rand(len(years))  # fast dummy signal
+series = np.random.rand(len(years))
 
 chart_data = pd.DataFrame({"Year": years, "GreenIndex": series})
 st.line_chart(chart_data, x="Year", y="GreenIndex")
-
