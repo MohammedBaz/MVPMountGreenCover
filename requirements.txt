@@ -3,3 +3,4 @@ streamlit-folium
 earthengine-api
 folium
 scikit-learn
+geopandas
