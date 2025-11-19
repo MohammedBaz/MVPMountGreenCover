@@ -4,7 +4,7 @@ from sklearn.cluster import KMeans
 import geopandas as gpd
 import json
 import time
-
+import streamlit as st
 # Caching wrappers for repeated EE operations
 @st.cache_data(show_spinner=False)
 def get_coarse_green_fraction_mapid(start_iso, end_iso, region, vis_params, scale=1000):
