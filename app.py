@@ -1,226 +1,195 @@
-# app.py
-import streamlit as st
-from streamlit_folium import st_folium
-import folium
-import ee
+# ---------------- FAST / COARSE PREVIEW + AI ANALYSIS ----------------
+import numpy as np
+from sklearn.cluster import KMeans
+import geopandas as gpd
 import json
-import pandas as pd
-import altair as alt
-import base64
-from datetime import datetime
+import time
 
-st.set_page_config(page_title="Saudi MGCI 2025 (MVP)", layout="wide")
+# Caching wrappers for repeated EE operations
+@st.cache_data(show_spinner=False)
+def get_coarse_green_fraction_mapid(start_iso, end_iso, region, vis_params, scale=1000):
+    """
+    Return a MapID for a coarse green fraction map (fast).
+    scale (meters) controls the internal reduction resolution; use large (e.g., 500-2000) for speed.
+    """
+    def dynamicworld_green_mask_img(s, e):
+        coll = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1") \
+            .filterDate(s, e) \
+            .filterBounds(region) \
+            .select("label")
+        def to_green(img):
+            # treat trees, grass, shrub, cultivation as green (1)
+            return img.remap([0,1,2,4,7],[0,1,1,1,1],0).rename('green')
+        green_mean = coll.map(lambda i: to_green(i)).mean().rename('green_fraction')
+        return green_mean
 
-st.title("🌿 Saudi Arabia — Mountain Green Cover Index (MGCI) MVP")
-st.markdown("**Live map • SDG 15.4.2 • Google Earth Engine + Dynamic World**")
+    green_frac = dynamicworld_green_mask_img(start_iso, end_iso).clip(region)
+    # optionally mask by mountains_mask if you have it in global scope
+    try:
+        green_frac = green_frac.updateMask(mountains_mask)
+    except Exception:
+        pass
 
-# --------- AUTHENTICATE Earth Engine ----------
-try:
-    credentials = ee.ServiceAccountCredentials(
-        st.secrets["gcp_service_account"]["client_email"],
-        key_data=st.secrets["gcp_service_account"]["private_key"]
-    )
-    ee.Initialize(credentials)
-    st.success("✅ Earth Engine initialized")
-except Exception as e:
-    st.error(f"EE init failed: {e}")
-    st.stop()
+    # reduce resolution by reprojecting (faster tiling)
+    green_small = green_frac.reproject(crs='EPSG:3857', scale=scale)
+    mapid = green_small.getMapId(vis_params)
+    return mapid
 
-# --------- Sidebar controls ----------
-st.sidebar.header("Settings")
-start_date = st.sidebar.date_input("Start date", value=pd.to_datetime("2025-01-01"))
-end_date = st.sidebar.date_input("End date", value=pd.to_datetime("2025-11-20"))
-opacity = st.sidebar.slider("Green layer opacity", 0.0, 1.0, 0.8)
-compute_button = st.sidebar.button("Compute MGCI")
-
-# Optional: timeseries range selector
-with st.sidebar.expander("Timeseries (optional)"):
-    ts_start = st.date_input("TS start", value=pd.to_datetime("2016-01-01"))
-    ts_end = st.date_input("TS end", value=pd.to_datetime("2025-12-31"))
-    ts_interval = st.selectbox("TS interval", ["year", "month"], index=0)
-
-# --------- Define geometry & datasets ----------
-saudi = ee.FeatureCollection("FAO/GAUL/2015/level0").filter(
-    ee.Filter.eq('ADM0_NAME', 'Saudi Arabia')
-)
-
-elevation = ee.Image("USGS/SRTMGL1_003")
-slope = ee.Terrain.slope(elevation)
-
-# mountain mask (same logic as earlier, using Or/And)
-mountain_cond = (
-    elevation.gte(4500)
-    .Or(elevation.gte(3500).And(elevation.lt(4500)))
-    .Or(elevation.gte(2500).And(elevation.lt(3500)))
-    .Or(elevation.gte(1500).And(elevation.lt(2500)).And(slope.gte(2)))
-    .Or(elevation.gte(1000).And(elevation.lt(1500)).And(slope.gte(2)))
-    .Or(elevation.gte(300).And(elevation.lt(1000)).And(slope.gte(5)))
-)
-mountains_mask = mountain_cond.selfMask().clip(saudi)
-
-# helper: build Dynamic World green mask for a date range
-def dynamicworld_green_mask(start, end, region):
+@st.cache_data(show_spinner=False)
+def compute_coarse_mgci(start_iso, end_iso, region, scale=1000):
+    """
+    Compute MGCI (coarse) quickly using large scale. Returns (green_area_m2, mountain_area_m2).
+    """
+    # build green_fraction image (mean over period)
     coll = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1") \
-        .filterDate(start, end) \
+        .filterDate(start_iso, end_iso) \
         .filterBounds(region) \
         .select("label")
-    # remap label -> green(1) / non-green(0)
-    # DynamicWorld label codes: 0:water,1:trees,2:grass,3:cloud,4:shrub,5:bare,6:snow,7:cultivation,8:built
-    # We'll treat trees, grass, shrub, cultivation as green (1)
     def to_green(img):
-        return img.remap([0,1,2,4,7],[0,1,1,1,1],0)
-    green_mode = coll.map(lambda i: to_green(i)).mode()
-    # threshold to get persistent green (>=0.5)
-    green_bin = green_mode.gte(0.5).selfMask().clip(region)
-    return green_bin
+        return img.remap([0,1,2,4,7],[0,1,1,1,1],0).rename('green')
+    green_mean = coll.map(lambda i: to_green(i)).mean().rename('green_fraction')
 
-# precompute static map tiles for the chosen start/end
-green_img = dynamicworld_green_mask(start_date.isoformat(), end_date.isoformat(), saudi) \
-    .updateMask(mountains_mask)  # only mountains
+    try:
+        green_mean = green_mean.updateMask(mountains_mask)
+    except Exception:
+        pass
 
-vis_params = {'min': 0, 'max': 1, 'palette': ['#f4f4f4', '#006400']}
-
-mapid = green_img.getMapId(vis_params)
-
-# --------- Folium map and st_folium ----------
-m = folium.Map(location=[23.5, 45], zoom_start=6, tiles="CartoDB positron")
-
-folium.TileLayer(
-    tiles=mapid['tile_fetcher'].url_format,
-    attr='Google Earth Engine',
-    name='2025 Green Cover',
-    overlay=True,
-    control=True,
-    opacity=opacity
-).add_to(m)
-
-# add boundary (convert to GeoJSON client-side)
-try:
-    saudi_geojson = saudi.getInfo()
-    folium.GeoJson(
-        saudi_geojson,
-        name="Saudi boundary",
-        style_function=lambda feat: {"color": "red", "weight": 2, "fillOpacity": 0}
-    ).add_to(m)
-except Exception as e:
-    st.warning(f"Could not retrieve GeoJSON for boundary (getInfo failed): {e}")
-
-folium.LayerControl().add_to(m)
-
-st.markdown("### 🔍 Interactive Map")
-# render with st_folium (recommended)
-st_folium(m, width=1200, height=650)
-
-# --------- Compute MGCI when requested ----------
-def compute_area_stats(green_img, mountains_mask, region):
-    # pixel area (m^2) image
-    pixel_area = ee.Image.pixelArea()
-
-    # green area within region
-    green_area_img = pixel_area.updateMask(green_img)
-    green_area = green_area_img.reduceRegion(
+    pixel_area = ee.Image.pixelArea().rename('area')
+    # compute total green area = sum(green_fraction * pixel_area)
+    green_area_img = green_mean.multiply(pixel_area)
+    green_area = ee.Number(green_area_img.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=region.geometry(),
-        scale=30,
+        scale=scale,
         maxPixels=1e13
-    ).get('area')
+    ).get('green_fraction')).getInfo()
 
-    # mountain total area (masked mountain pixels)
-    mountain_area_img = pixel_area.updateMask(mountains_mask)
-    mountain_area = mountain_area_img.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=region.geometry(),
-        scale=30,
-        maxPixels=1e13
-    ).get('area')
+    # compute mountain area (sum of pixel_area within mountains_mask)
+    try:
+        mountain_area_img = pixel_area.updateMask(mountains_mask)
+        mountain_area = ee.Number(mountain_area_img.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=region.geometry(),
+            scale=scale,
+            maxPixels=1e13
+        ).get('area')).getInfo()
+    except Exception:
+        mountain_area = None
 
-    # return numbers (will be ee Objects)
-    return ee.Number(green_area), ee.Number(mountain_area)
+    return green_area or 0.0, mountain_area or 0.0
 
-if compute_button:
-    with st.spinner("Computing MGCI... this may take 15–60s depending on region..."):
+# ---------------- UI: fast preview ----------------
+st.markdown("### Fast preview (coarse, interactive)")
+col1, col2 = st.columns([2,1])
+
+with col2:
+    st.info("This is a coarse preview designed to be very fast. Use 'Compute high-res' for detailed results.")
+    if st.button("Compute high-res MGCI (slower)"):
+        run_highres = True
+    else:
+        run_highres = False
+
+# visualization params for MapID
+vis_params_coarse = {'min': 0, 'max': 1, 'palette': ['#f4f4f4', '#006400']}
+
+# get and display coarse map tiles (fast)
+with st.spinner("Generating coarse preview map..."):
+    try:
+        mapid_coarse = get_coarse_green_fraction_mapid(start_date.isoformat(), end_date.isoformat(),
+                                                      saudi, vis_params_coarse, scale=1000)
+        m_fast = folium.Map(location=[23.5, 45], zoom_start=5, tiles="CartoDB positron")
+        folium.TileLayer(
+            tiles=mapid_coarse['tile_fetcher'].url_format,
+            attr='GEE (coarse)',
+            name='Coarse green fraction',
+            overlay=True,
+            opacity=0.85
+        ).add_to(m_fast)
+        folium.LayerControl().add_to(m_fast)
+        # render quickly using st_folium
+        st_folium(m_fast, width=900, height=500)
+    except Exception as e:
+        st.error(f"Coarse preview failed: {e}")
+
+# compute and show coarse MGCI KPI right away (fast)
+with st.spinner("Computing coarse MGCI (fast)…"):
+    try:
+        green_m2, mountain_m2 = compute_coarse_mgci(start_date.isoformat(), end_date.isoformat(), saudi, scale=1000)
+        if mountain_m2 and mountain_m2 > 0:
+            mgci_pct = green_m2 / mountain_m2 * 100.0
+            st.metric(label="Coarse MGCI (preview)", value=f"{mgci_pct:.2f} %")
+            st.write(f"Mountain area (coarse) = {mountain_m2/1e6:,.1f} km²; green area (coarse) = {green_m2/1e6:,.1f} km²")
+        else:
+            st.warning("Could not compute mountain area at coarse scale.")
+    except Exception as e:
+        st.error(f"Coarse MGCI calc failed: {e}")
+
+# ---------------- Optional: per-region aggregation + lightweight AI clustering ----------------
+st.markdown("### Lightweight AI insight: clustering provinces by mountain green fraction")
+if st.button("Run regional clustering (fast)"):
+    with st.spinner("Aggregating per-region stats and clustering..."):
         try:
-            green_area_ee, mountain_area_ee = compute_area_stats(green_img, mountains_mask, saudi)
-            green_area = green_area_ee.getInfo() or 0.0
-            mountain_area = mountain_area_ee.getInfo() or 0.0
+            # get admin1 regions (FAO GAUL level1)
+            provinces = ee.FeatureCollection("FAO/GAUL/2015/level1").filterBounds(saudi)
+            # reduce each province to mean green_fraction (coarse)
+            def province_green(feat):
+                gf = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1") \
+                        .filterDate(start_date.isoformat(), end_date.isoformat()) \
+                        .filterBounds(feat.geometry()) \
+                        .select("label") \
+                        .map(lambda i: i.remap([0,1,2,4,7],[0,1,1,1,1],0)).mean().rename('green_fraction')
+                # mask by mountains when possible
+                try:
+                    gf = gf.updateMask(mountains_mask)
+                except Exception:
+                    pass
+                mean_val = ee.Number(gf.reduceRegion(reducer=ee.Reducer.mean(), geometry=feat.geometry(), scale=1000, maxPixels=1e13).get('green_fraction'))
+                return feat.set({'green_fraction': mean_val})
+            provinces_stats = provinces.map(province_green)
 
-            mgci_pct = (green_area / mountain_area * 100) if mountain_area > 0 else None
+            # bring a small table client-side (safe: few features)
+            prov_info = provinces_stats.select(['ADM1_NAME','green_fraction']).getInfo()
+            rows = []
+            for f in prov_info['features']:
+                name = f['properties'].get('ADM1_NAME') or f['properties'].get('NAME_1') or "unknown"
+                v = f['properties'].get('green_fraction')
+                rows.append({'province': name, 'green_fraction': (v if v is not None else 0.0)})
+            import pandas as pd
+            df_prov = pd.DataFrame(rows).dropna().reset_index(drop=True)
 
-            # friendly formatting
-            st.metric("Mountain area (km²)", f"{mountain_area/1e6:,.2f}")
-            st.metric("Green area in mountains (km²)", f"{green_area/1e6:,.2f}")
-            if mgci_pct is not None:
-                st.success(f"MGCI: {mgci_pct:.2f}%")
+            # run a tiny KMeans (k=3) on green fraction
+            k = min(3, max(2, len(df_prov)//3))
+            if len(df_prov) >= 3:
+                km = KMeans(n_clusters=k, random_state=0).fit(df_prov[['green_fraction']])
+                df_prov['cluster'] = km.labels_.astype(int)
+                st.dataframe(df_prov.sort_values('green_fraction'))
+                # simple chart
+                chart = alt.Chart(df_prov).mark_bar().encode(
+                    x='province',
+                    y='green_fraction',
+                    color='cluster:N',
+                    tooltip=['province','green_fraction','cluster']
+                ).properties(width=800, height=300)
+                st.altair_chart(chart)
             else:
-                st.error("Could not compute MGCI (mountain_area==0)")
-
-            # small report + download GeoJSON of green mask (vectorized)
-            # vectorize green cells to polygons (optional & may be heavy)
-            export_fc = green_img.reduceToVectors(
-                geometry=saudi.geometry(),
-                scale=30,
-                geometryType='polygon',
-                eightConnected=False,
-                labelProperty='green',
-                maxPixels=1e13
-            )
-            # get a small preview (first features) as GeoJSON
-            try:
-                export_geojson = export_fc.getInfo()
-                geojson_str = json.dumps(export_geojson)
-                b64 = base64.b64encode(geojson_str.encode()).decode()
-                href = f'<a href="data:application/json;base64,{b64}" download="green_mask.geojson">⬇️ Download green_mask.geojson (preview)</a>'
-                st.markdown(href, unsafe_allow_html=True)
-            except Exception as e:
-                st.info("Vectorization preview failed (server-side). You can export full raster/asset via Earth Engine Tasks.")
+                st.info("Not enough provinces found to cluster.")
         except Exception as e:
-            st.error(f"MGCI computation failed: {e}")
+            st.error(f"Regional clustering failed: {e}")
 
-# --------- Timeseries (annual) - lightweight client-side chart using EE reductions ----------
-def ts_mgci_by_year(start, end, region, mountains_mask):
-    years = list(range(start.year, end.year + 1))
-    rows = []
-    for y in years:
-        s = datetime(y, 1, 1).isoformat()
-        e = datetime(y, 12, 31).isoformat()
-        img = dynamicworld_green_mask(s, e, region).updateMask(mountains_mask)
-        pixel_area = ee.Image.pixelArea()
-        green_area = ee.Number(pixel_area.updateMask(img).reduceRegion(
-            reducer=ee.Reducer.sum(),
-            geometry=region.geometry(),
-            scale=30,
-            maxPixels=1e13
-        ).get('area'))
-        mountain_area = ee.Number(pixel_area.updateMask(mountains_mask).reduceRegion(
-            reducer=ee.Reducer.sum(),
-            geometry=region.geometry(),
-            scale=30,
-            maxPixels=1e13
-        ).get('area'))
-        # compute percent as ee.Number (but we'll getInfo below)
-        percent = ee.Algorithms.If(mountain_area.gt(0), green_area.divide(mountain_area).multiply(100), None)
-        try:
-            ga = green_area.getInfo() or 0.0
-            ma = mountain_area.getInfo() or 0.0
-            pct = percent.getInfo() if (ma and ma > 0) else None
-            rows.append({'year': y, 'green_km2': ga/1e6, 'mountain_km2': ma/1e6, 'pct': pct})
-        except Exception:
-            # if any getInfo fails, append None
-            rows.append({'year': y, 'green_km2': None, 'mountain_km2': None, 'pct': None})
-    return pd.DataFrame(rows)
-
-with st.expander("Show Annual MGCI timeseries (2016–2025)"):
-    if st.button("Compute timeseries"):
-        with st.spinner("Computing timeseries (this may take some minutes)..."):
-            df_ts = ts_mgci_by_year(ts_start, ts_end, saudi, mountains_mask)
-            st.dataframe(df_ts)
-            chart = alt.Chart(df_ts).mark_line(point=True).encode(
-                x='year:O',
-                y='pct:Q',
-                tooltip=['year','green_km2','mountain_km2','pct']
-            ).properties(width=800, height=300, title="Annual MGCI (%)")
-            st.altair_chart(chart)
-
-st.markdown("---")
-st.caption("Notes: green mask uses Dynamic World labels remapped to 'green' (trees, grass, shrub, cultivation). "
-           "MGCI = green area within mountain mask / mountain area. Results depend on date range and thresholds.")
+# ---------------- High-res explicit compute (only when user asked) ----------------
+if run_highres:
+    st.markdown("## High-resolution MGCI (explicit request)")
+    st.warning("High-resolution computation can take several minutes. This runs at finer scale (e.g., 30m).")
+    if st.button("Start high-res now"):
+        start_time = time.time()
+        with st.spinner("Running high-res MGCI at 30m... this may take multiple minutes..."):
+            try:
+                highres_green_m2, highres_mountain_m2 = compute_coarse_mgci(start_date.isoformat(), end_date.isoformat(), saudi, scale=30)
+                if highres_mountain_m2 > 0:
+                    mgci_high = highres_green_m2 / highres_mountain_m2 * 100.0
+                    st.success(f"High-res MGCI = {mgci_high:.2f}% (computed at ~30m)")
+                    st.write(f"Time elapsed: {time.time() - start_time:.0f} s")
+                else:
+                    st.error("High-res mountain area is zero.")
+            except Exception as e:
+                st.error(f"High-res computation failed: {e}")
